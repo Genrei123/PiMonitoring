@@ -1,7 +1,9 @@
 import os
 import platform
+import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Dict
 
 import cv2
@@ -41,20 +43,65 @@ def open_capture(index: int):
 
     elif system_name == "linux":
         cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-        if cap.isOpened():
-            return cap
-        cap.release()
+        return cap
 
     return cv2.VideoCapture(index)
 
 
+def _linux_candidate_indexes(max_scan: int):
+    video_nodes = sorted(Path("/dev").glob("video*"))
+    node_indexes = []
+
+    for node in video_nodes:
+        suffix = node.name.replace("video", "")
+        if not suffix.isdigit():
+            continue
+
+        index = int(suffix)
+        if index > max_scan:
+            continue
+
+        try:
+            details = subprocess.run(
+                ["v4l2-ctl", "-d", str(node), "--all"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            out = (details.stdout or "") + (details.stderr or "")
+            if "Video Capture" not in out and "Video Capture Multiplanar" not in out:
+                continue
+        except Exception:
+            pass
+
+        node_indexes.append(index)
+
+    if node_indexes:
+        return node_indexes
+
+    return list(range(max_scan + 1))
+
+
 def detect_available_cameras(max_scan: int = 8):
     detected = []
-    for idx in range(max_scan):
+    system_name = platform.system().lower()
+    if system_name == "linux":
+        probe_indexes = _linux_candidate_indexes(max_scan)
+    else:
+        probe_indexes = list(range(max_scan + 1))
+
+    for idx in probe_indexes:
         cap = open_capture(idx)
         if cap.isOpened():
-            ok, _ = cap.read()
-            if ok:
+            ok_count = 0
+            for _ in range(5):
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.size > 0:
+                    ok_count += 1
+                time.sleep(0.03)
+
+            if ok_count >= 2:
                 detected.append(idx)
         cap.release()
     return detected
