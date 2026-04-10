@@ -1,5 +1,6 @@
 import os
 import platform
+import re
 import subprocess
 import threading
 import time
@@ -27,6 +28,7 @@ frame_store: Dict[int, bytes] = {}
 frame_lock = threading.Lock()
 camera_status: Dict[int, Dict[str, object]] = {}
 configured_camera_indexes = []
+camera_slot_map: Dict[int, int] = {}
 
 
 def open_capture(index: int):
@@ -60,8 +62,6 @@ def _linux_candidate_indexes(max_scan: int):
             continue
 
         index = int(suffix)
-        if index > max_scan:
-            continue
 
         try:
             details = subprocess.run(
@@ -80,7 +80,16 @@ def _linux_candidate_indexes(max_scan: int):
         node_indexes.append(index)
 
     if node_indexes:
-        return node_indexes
+        return sorted(set(node_indexes))
+
+    if video_nodes:
+        fallback_indexes = []
+        for node in video_nodes:
+            match = re.search(r"video(\d+)$", node.name)
+            if match:
+                fallback_indexes.append(int(match.group(1)))
+        if fallback_indexes:
+            return sorted(set(fallback_indexes))
 
     return list(range(max_scan + 1))
 
@@ -91,7 +100,7 @@ def _linux_video_nodes():
     return sorted(str(node) for node in Path("/dev").glob("video*"))
 
 
-def detect_available_cameras(max_scan: int = 8):
+def detect_available_cameras(max_scan: int = 64):
     detected = []
     system_name = platform.system().lower()
     if system_name == "linux":
@@ -130,31 +139,42 @@ def resolve_camera_indexes():
         print(f"Auto-detected cameras: {detected}")
         return detected
 
+    if platform.system().lower() == "linux":
+        linux_candidates = _linux_candidate_indexes(64)
+        if linux_candidates:
+            fallback = [linux_candidates[0]]
+            print(
+                "No cameras passed frame-read detection; "
+                f"falling back to first Linux video node index: {fallback}"
+            )
+            return fallback
+
     print("No cameras auto-detected; defaulting to [0]")
     return [0]
 
 
-def stream_camera(cam_index: int):
-    camera_status[cam_index] = {
+def stream_camera(slot: int, physical_index: int):
+    camera_status[slot] = {
         "state": "opening",
         "frames": 0,
         "last_error": None,
+        "physical_index": physical_index,
     }
 
-    cap = open_capture(cam_index)
+    cap = open_capture(physical_index)
     if not cap.isOpened():
-        camera_status[cam_index]["state"] = "open_failed"
-        camera_status[cam_index]["last_error"] = "could_not_open"
-        print(f"[cam{cam_index}] Failed to open camera")
+        camera_status[slot]["state"] = "open_failed"
+        camera_status[slot]["last_error"] = "could_not_open"
+        print(f"[slot{slot}/cam{physical_index}] Failed to open camera")
         return
 
-    camera_status[cam_index]["state"] = "running"
-    print(f"[cam{cam_index}] Capture loop started")
+    camera_status[slot]["state"] = "running"
+    print(f"[slot{slot}/cam{physical_index}] Capture loop started")
     while True:
         ret, frame = cap.read()
         if not ret:
-            camera_status[cam_index]["state"] = "read_failed"
-            camera_status[cam_index]["last_error"] = "read_returned_false"
+            camera_status[slot]["state"] = "read_failed"
+            camera_status[slot]["last_error"] = "read_returned_false"
             time.sleep(0.2)
             continue
 
@@ -165,16 +185,16 @@ def stream_camera(cam_index: int):
             [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
         )
         if not ok:
-            camera_status[cam_index]["state"] = "encode_failed"
-            camera_status[cam_index]["last_error"] = "jpeg_encode_failed"
+            camera_status[slot]["state"] = "encode_failed"
+            camera_status[slot]["last_error"] = "jpeg_encode_failed"
             continue
 
         with frame_lock:
-            frame_store[cam_index] = buffer.tobytes()
+            frame_store[slot] = buffer.tobytes()
 
-        camera_status[cam_index]["state"] = "running"
-        camera_status[cam_index]["frames"] = int(camera_status[cam_index].get("frames", 0)) + 1
-        camera_status[cam_index]["last_error"] = None
+        camera_status[slot]["state"] = "running"
+        camera_status[slot]["frames"] = int(camera_status[slot].get("frames", 0)) + 1
+        camera_status[slot]["last_error"] = None
 
         time.sleep(FRAME_INTERVAL_SECONDS)
 
@@ -186,6 +206,7 @@ def health():
             "ok": True,
             "cameras": list(frame_store.keys()),
             "configured": configured_camera_indexes,
+            "slot_map": camera_slot_map,
             "status": camera_status,
             "linux_video_nodes": _linux_video_nodes(),
         }
@@ -216,6 +237,21 @@ def mjpeg_generator(cam_index: int):
 
 @app.get("/cam/<int:cam_index>/mjpeg")
 def mjpeg(cam_index: int):
+    if cam_index not in camera_slot_map:
+        return Response(
+            f"Unknown camera slot {cam_index}. Available slots: {sorted(camera_slot_map.keys())}",
+            status=404,
+            mimetype="text/plain",
+        )
+
+    if cam_index not in frame_store:
+        state = camera_status.get(cam_index, {})
+        return Response(
+            f"Camera slot {cam_index} is not ready yet. State: {state}",
+            status=503,
+            mimetype="text/plain",
+        )
+
     return Response(
         mjpeg_generator(cam_index),
         mimetype="multipart/x-mixed-replace; boundary=frame",
@@ -225,10 +261,12 @@ def mjpeg(cam_index: int):
 if __name__ == "__main__":
     camera_indexes = resolve_camera_indexes()
     configured_camera_indexes = camera_indexes
-    print(f"Serving camera indexes: {camera_indexes}")
+    camera_slot_map = {slot: idx for slot, idx in enumerate(camera_indexes)}
+    print(f"Serving physical camera indexes: {camera_indexes}")
+    print(f"Camera slot map: {camera_slot_map}")
 
-    for idx in camera_indexes:
-        t = threading.Thread(target=stream_camera, args=(idx,), daemon=True)
+    for slot, idx in camera_slot_map.items():
+        t = threading.Thread(target=stream_camera, args=(slot, idx), daemon=True)
         t.start()
 
     print(f"Flask streamer listening on http://{HOST}:{PORT}")
