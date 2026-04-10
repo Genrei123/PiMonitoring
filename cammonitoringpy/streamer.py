@@ -22,6 +22,7 @@ FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
 FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "480"))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "45"))
 FRAME_INTERVAL_SECONDS = float(os.getenv("FRAME_INTERVAL_SECONDS", "0.05"))
+MAX_CAMERAS = int(os.getenv("MAX_CAMERAS", "2"))
 
 app = Flask(__name__)
 frame_store: Dict[int, bytes] = {}
@@ -52,32 +53,94 @@ def open_capture(index: int):
     return cv2.VideoCapture(index)
 
 
+def _linux_is_capture_node(node: Path) -> bool:
+    try:
+        details = subprocess.run(
+            ["v4l2-ctl", "-d", str(node), "--all"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if details.returncode != 0:
+            return False
+
+        out = (details.stdout or "") + (details.stderr or "")
+        return "Video Capture" in out or "Video Capture Multiplanar" in out
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+
+
+def _linux_indexes_from_list_devices():
+    try:
+        proc = subprocess.run(
+            ["v4l2-ctl", "--list-devices"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return []
+
+        lines = (proc.stdout or "").splitlines()
+        blocks = []
+        current = []
+
+        for line in lines:
+            if line.strip() == "":
+                if current:
+                    blocks.append(current)
+                    current = []
+                continue
+            current.append(line)
+        if current:
+            blocks.append(current)
+
+        indexes = []
+        for block in blocks:
+            node_paths = []
+            for line in block:
+                m = re.search(r"(/dev/video\d+)", line)
+                if m:
+                    node_paths.append(m.group(1))
+
+            chosen = None
+            for path in node_paths:
+                node = Path(path)
+                if _linux_is_capture_node(node):
+                    suffix = node.name.replace("video", "")
+                    if suffix.isdigit():
+                        chosen = int(suffix)
+                        break
+
+            if chosen is not None:
+                indexes.append(chosen)
+
+        return sorted(set(indexes))
+    except Exception:
+        return []
+
+
 def _linux_candidate_indexes(max_scan: int):
+    preferred = _linux_indexes_from_list_devices()
+    if preferred:
+        return preferred
+
     video_nodes = sorted(Path("/dev").glob("video*"))
     node_indexes = []
-
     for node in video_nodes:
         suffix = node.name.replace("video", "")
         if not suffix.isdigit():
             continue
 
         index = int(suffix)
-
-        try:
-            details = subprocess.run(
-                ["v4l2-ctl", "-d", str(node), "--all"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                check=False,
-            )
-            out = (details.stdout or "") + (details.stderr or "")
-            if "Video Capture" not in out and "Video Capture Multiplanar" not in out:
-                continue
-        except Exception:
-            pass
-
-        node_indexes.append(index)
+        if index > max_scan:
+            continue
+        if _linux_is_capture_node(node):
+            node_indexes.append(index)
 
     if node_indexes:
         return sorted(set(node_indexes))
@@ -136,16 +199,17 @@ def resolve_camera_indexes():
 
     detected = detect_available_cameras()
     if detected:
-        print(f"Auto-detected cameras: {detected}")
-        return detected
+        chosen = detected[:MAX_CAMERAS]
+        print(f"Auto-detected cameras: {detected}; using {chosen}")
+        return chosen
 
     if platform.system().lower() == "linux":
         linux_candidates = _linux_candidate_indexes(64)
         if linux_candidates:
-            fallback = [linux_candidates[0]]
+            fallback = linux_candidates[:MAX_CAMERAS]
             print(
                 "No cameras passed frame-read detection; "
-                f"falling back to first Linux video node index: {fallback}"
+                f"falling back to Linux candidate indexes: {fallback}"
             )
             return fallback
 
