@@ -25,6 +25,8 @@ FRAME_INTERVAL_SECONDS = float(os.getenv("FRAME_INTERVAL_SECONDS", "0.05"))
 app = Flask(__name__)
 frame_store: Dict[int, bytes] = {}
 frame_lock = threading.Lock()
+camera_status: Dict[int, Dict[str, object]] = {}
+configured_camera_indexes = []
 
 
 def open_capture(index: int):
@@ -83,6 +85,12 @@ def _linux_candidate_indexes(max_scan: int):
     return list(range(max_scan + 1))
 
 
+def _linux_video_nodes():
+    if platform.system().lower() != "linux":
+        return []
+    return sorted(str(node) for node in Path("/dev").glob("video*"))
+
+
 def detect_available_cameras(max_scan: int = 8):
     detected = []
     system_name = platform.system().lower()
@@ -127,15 +135,26 @@ def resolve_camera_indexes():
 
 
 def stream_camera(cam_index: int):
+    camera_status[cam_index] = {
+        "state": "opening",
+        "frames": 0,
+        "last_error": None,
+    }
+
     cap = open_capture(cam_index)
     if not cap.isOpened():
+        camera_status[cam_index]["state"] = "open_failed"
+        camera_status[cam_index]["last_error"] = "could_not_open"
         print(f"[cam{cam_index}] Failed to open camera")
         return
 
+    camera_status[cam_index]["state"] = "running"
     print(f"[cam{cam_index}] Capture loop started")
     while True:
         ret, frame = cap.read()
         if not ret:
+            camera_status[cam_index]["state"] = "read_failed"
+            camera_status[cam_index]["last_error"] = "read_returned_false"
             time.sleep(0.2)
             continue
 
@@ -146,17 +165,31 @@ def stream_camera(cam_index: int):
             [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
         )
         if not ok:
+            camera_status[cam_index]["state"] = "encode_failed"
+            camera_status[cam_index]["last_error"] = "jpeg_encode_failed"
             continue
 
         with frame_lock:
             frame_store[cam_index] = buffer.tobytes()
+
+        camera_status[cam_index]["state"] = "running"
+        camera_status[cam_index]["frames"] = int(camera_status[cam_index].get("frames", 0)) + 1
+        camera_status[cam_index]["last_error"] = None
 
         time.sleep(FRAME_INTERVAL_SECONDS)
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "cameras": list(frame_store.keys())})
+    return jsonify(
+        {
+            "ok": True,
+            "cameras": list(frame_store.keys()),
+            "configured": configured_camera_indexes,
+            "status": camera_status,
+            "linux_video_nodes": _linux_video_nodes(),
+        }
+    )
 
 
 @app.get("/cam/<int:cam_index>/frame.jpg")
@@ -191,6 +224,7 @@ def mjpeg(cam_index: int):
 
 if __name__ == "__main__":
     camera_indexes = resolve_camera_indexes()
+    configured_camera_indexes = camera_indexes
     print(f"Serving camera indexes: {camera_indexes}")
 
     for idx in camera_indexes:
