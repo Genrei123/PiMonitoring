@@ -1,0 +1,6 @@
+# Python cache/artifacts
+__pycache__/
+*.pyc
+
+# Local Firebase admin credentials (never commit)
+serviceAccountKey.json
