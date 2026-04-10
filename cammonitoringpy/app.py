@@ -34,6 +34,55 @@ FONT_SMALL = ("SF Pro Text", 10)
 FONT_MONO = ("SF Mono", 11)
 
 
+CAMERA_INDEXES_ENV = os.getenv("CAMERA_INDEXES")
+
+
+def detect_available_cameras(max_scan: int = 8):
+    detected = []
+    for idx in range(max_scan):
+        system_name = platform.system().lower()
+
+        if system_name == "windows":
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(idx, cv2.CAP_MSMF)
+        elif system_name == "linux":
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        else:
+            cap = cv2.VideoCapture(idx)
+
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                detected.append(idx)
+        cap.release()
+
+    return detected
+
+
+def resolve_camera_indexes(default_count: int = 2):
+    if CAMERA_INDEXES_ENV:
+        configured = [
+            int(idx.strip())
+            for idx in CAMERA_INDEXES_ENV.split(",")
+            if idx.strip()
+        ]
+        if configured:
+            print(f"Using CAMERA_INDEXES from env: {configured}")
+            return configured
+
+    detected = detect_available_cameras(max_scan=10)
+    if detected:
+        chosen = detected[:default_count]
+        print(f"Auto-detected camera indexes: {detected}; using {chosen}")
+        return chosen
+
+    fallback = [0]
+    print(f"No readable cameras auto-detected; falling back to {fallback}")
+    return fallback
+
+
 class CameraFeed:
     def __init__(self, index: int):
         self.index = index
@@ -746,8 +795,6 @@ class HomePage(ctk.CTkFrame):
 
 
 class App(ctk.CTk):
-    CAMERA_INDEXES = [0, 1]
-
     def __init__(self):
         super().__init__()
         self.title("CAM MONITOR")
@@ -760,6 +807,7 @@ class App(ctk.CTk):
         self._active = None
         self._fullscreen_window = None
         self._streamer_process = None
+        self._camera_indexes = resolve_camera_indexes(default_count=2)
 
         self._start_streamer_process()
 
@@ -805,7 +853,7 @@ class App(ctk.CTk):
         if self._feeds:
             return
 
-        for idx in self.CAMERA_INDEXES:
+        for idx in self._camera_indexes:
             feed = CameraFeed(idx)
             feed.start()
             self._feeds.append(feed)
@@ -874,4 +922,20 @@ class App(ctk.CTk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    is_linux = platform.system().lower() == "linux"
+    has_display = bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
+
+    if is_linux and not has_display:
+        streamer_path = os.path.join(os.path.dirname(__file__), "streamer.py")
+        print("No GUI display detected (DISPLAY/WAYLAND_DISPLAY is not set).")
+        print("Starting headless streamer mode instead of CustomTkinter UI.")
+
+        if os.path.exists(streamer_path):
+            try:
+                subprocess.call([sys.executable, streamer_path], cwd=os.path.dirname(__file__))
+            except Exception as exc:
+                print(f"Failed to start headless streamer: {exc}")
+        else:
+            print(f"streamer.py not found: {streamer_path}")
+    else:
+        App().mainloop()
